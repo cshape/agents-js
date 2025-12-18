@@ -102,6 +102,7 @@ interface InworldResult {
   contextId?: string;
   contextCreated?: boolean;
   contextClosed?: boolean;
+  flushCompleted?: boolean;
   audioChunk?: AudioChunk;
   audioContent?: string;
   status?: { code: number; message: string };
@@ -142,6 +143,7 @@ const defaultTTSOptionsBase: Omit<TTSOptions, 'tokenizer'> = {
 
 const MAX_RETRIES = 2;
 const BASE_DELAY_MS = 1000;
+const MAX_SESSION_DURATION_MS = 300_000; // 5 minutes max session duration
 
 class WSConnectionPool {
   #ws?: WebSocket;
@@ -150,6 +152,7 @@ class WSConnectionPool {
   #connecting?: Promise<WebSocket>;
   #listeners: Map<string, (msg: InworldMessage) => void> = new Map();
   #logger = log();
+  #connectionCreatedAt?: number;
 
   constructor(url: string, auth: string) {
     this.#url = url;
@@ -157,8 +160,16 @@ class WSConnectionPool {
   }
 
   async getConnection(): Promise<WebSocket> {
+    // Check if existing connection is still valid and not expired
     if (this.#ws && this.#ws.readyState === WebSocket.OPEN) {
-      return this.#ws;
+      const sessionAge = Date.now() - (this.#connectionCreatedAt || 0);
+      if (sessionAge < MAX_SESSION_DURATION_MS) {
+        return this.#ws;
+      }
+      // Session expired, close and reconnect
+      this.#logger.debug({ sessionAgeMs: sessionAge }, 'Inworld WebSocket session expired, reconnecting');
+      this.#ws.close();
+      this.#ws = undefined;
     }
 
     if (this.#connecting) {
@@ -208,7 +219,9 @@ class WSConnectionPool {
 
       ws.on('open', () => {
         this.#ws = ws;
+        this.#connectionCreatedAt = Date.now();
         this.#connecting = undefined;
+        this.#logger.debug('Established new Inworld TTS WebSocket connection');
         resolve(ws);
       });
 
@@ -264,6 +277,8 @@ export class TTS extends tts.TTS {
   #opts: TTSOptions;
   #pool: WSConnectionPool;
   #authorization: string;
+  #contextId: string;
+  #contextCreatedOnWs?: WebSocket; // Track which WS the context was created on
   label = 'inworld.TTS';
 
   constructor(opts: Partial<TTSOptions> = {}) {
@@ -282,6 +297,7 @@ export class TTS extends tts.TTS {
     }
     this.#authorization = `Basic ${mergedOpts.apiKey}`;
     this.#pool = new WSConnectionPool(this.#opts.wsURL, this.#authorization);
+    this.#contextId = shortuuid();
   }
 
   get pool(): WSConnectionPool {
@@ -290,6 +306,32 @@ export class TTS extends tts.TTS {
 
   get authorization(): string {
     return this.#authorization;
+  }
+
+  get contextId(): string {
+    return this.#contextId;
+  }
+
+  /**
+   * Check if context was created on the given WebSocket connection.
+   * Returns false if context doesn't exist or was created on a different connection.
+   */
+  isContextValidForWs(ws: WebSocket): boolean {
+    return this.#contextCreatedOnWs === ws;
+  }
+
+  /**
+   * Mark the context as created on the given WebSocket connection.
+   */
+  markContextCreated(ws: WebSocket): void {
+    this.#contextCreatedOnWs = ws;
+  }
+
+  /**
+   * Clear the context state (used when closing).
+   */
+  clearContext(): void {
+    this.#contextCreatedOnWs = undefined;
   }
 
   /**
@@ -342,6 +384,19 @@ export class TTS extends tts.TTS {
   }
 
   async close() {
+    // Close the context if it was created
+    if (this.#contextCreatedOnWs) {
+      try {
+        const ws = await this.#pool.getConnection();
+        // Only send close_context if we're on the same connection where context was created
+        if (ws === this.#contextCreatedOnWs && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ close_context: {}, contextId: this.#contextId }));
+        }
+      } catch {
+        // Connection may already be closed
+      }
+      this.#contextCreatedOnWs = undefined;
+    }
     this.#pool.close();
   }
 }
@@ -472,17 +527,22 @@ class ChunkedStream extends tts.ChunkedStream {
   }
 }
 
+const MAX_TEXT_CHUNK_SIZE = 1000; // Inworld API limit: max 1000 characters per send_text request
+
 class SynthesizeStream extends tts.SynthesizeStream {
   #opts: TTSOptions;
   #tts: TTS;
-  #contextId: string;
+  #logger = log();
   label = 'inworld.SynthesizeStream';
 
   constructor(ttsInstance: TTS, opts: TTSOptions) {
     super(ttsInstance);
     this.#tts = ttsInstance;
     this.#opts = opts;
-    this.#contextId = shortuuid();
+  }
+
+  get #contextId(): string {
+    return this.#tts.contextId;
   }
 
   protected async run() {
@@ -490,21 +550,51 @@ class SynthesizeStream extends tts.SynthesizeStream {
     const bstream = new AudioByteStream(this.#opts.sampleRate, NUM_CHANNELS);
     const tokenizerStream = this.#opts.tokenizer!.stream();
 
-    let resolveProcessing: () => void;
-    let rejectProcessing: (err: Error) => void;
-    const processing = new Promise<void>((resolve, reject) => {
-      resolveProcessing = resolve;
-      rejectProcessing = reject;
-    });
+    // Track pending flushes - we wait for flushCompleted before continuing
+    let pendingFlushResolve: (() => void) | null = null;
+    let lastAudioReceivedAt = 0;
 
     const handleMessage = (msg: InworldMessage) => {
       const result = msg.result;
       if (!result) return;
 
+      // Check for errors in status
+      if (result.status && result.status.code !== 0) {
+        this.#logger.error(
+          { contextId: this.#contextId, status: result.status },
+          'Inworld stream error',
+        );
+        return;
+      }
+
+      // Handle context created response
       if (result.contextCreated) {
-      } else if (result.contextClosed) {
-        resolveProcessing();
-      } else if (result.audioChunk) {
+        this.#logger.debug({ contextId: this.#contextId }, 'Inworld context created');
+        return;
+      }
+
+      // Handle flush completed - resolve pending flush promise
+      if (result.flushCompleted) {
+        this.#logger.debug({ contextId: this.#contextId }, 'Inworld flush completed');
+        if (pendingFlushResolve) {
+          pendingFlushResolve();
+          pendingFlushResolve = null;
+        }
+        return;
+      }
+
+      // Handle context closed response (server initiated cleanup)
+      if (result.contextClosed) {
+        this.#logger.debug({ contextId: this.#contextId }, 'Inworld context closed by server');
+        // Invalidate context so it gets recreated on next stream
+        this.#tts.clearContext();
+        return;
+      }
+
+      // Handle audio chunks
+      if (result.audioChunk) {
+        lastAudioReceivedAt = Date.now();
+
         if (result.audioChunk.timestampInfo) {
           const tsInfo = result.audioChunk.timestampInfo;
           if (tsInfo.wordAlignment) {
@@ -555,24 +645,54 @@ class SynthesizeStream extends tts.SynthesizeStream {
             }
           }
         }
-      } else if (result.status && result.status.code !== 0) {
-        const error = new Error(`Inworld stream error: ${result.status.message}`);
-        rejectProcessing(error);
       }
     };
 
     this.#tts.pool.registerListener(this.#contextId, handleMessage);
 
+    // Helper to wait for flush completion with timeout
+    const waitForFlushComplete = (): Promise<void> => {
+      return new Promise((resolve) => {
+        pendingFlushResolve = resolve;
+        // Timeout after 10 seconds if no flushCompleted received
+        setTimeout(() => {
+          if (pendingFlushResolve) {
+            this.#logger.warn({ contextId: this.#contextId }, 'Flush timeout, continuing');
+            pendingFlushResolve = null;
+            resolve();
+          }
+        }, 10_000);
+      });
+    };
+
+    // Send text in chunks (respecting API limit) and flush after each sentence
     const sendLoop = async () => {
       for await (const ev of tokenizerStream) {
-        await this.#sendText(ws, ev.token);
+        const text = ev.token;
+        // Chunk text to stay within API limits
+        for (let i = 0; i < text.length; i += MAX_TEXT_CHUNK_SIZE) {
+          const chunk = text.slice(i, i + MAX_TEXT_CHUNK_SIZE);
+          await this.#sendText(ws, chunk);
+        }
+        // Flush after each sentence to trigger audio generation
+        await this.#flushContext(ws);
+        // Wait for this flush to complete before sending more text
+        await waitForFlushComplete();
       }
     };
-    const sendPromise = sendLoop();
 
     try {
-      await this.#createContext(ws);
+      // Create context if it doesn't exist or if we're on a new WebSocket connection
+      // (handles reconnection after session expiry or network issues)
+      if (!this.#tts.isContextValidForWs(ws)) {
+        await this.#createContext(ws);
+        this.#tts.markContextCreated(ws);
+      }
 
+      // Start send loop (runs concurrently with input processing)
+      const sendPromise = sendLoop();
+
+      // Process input and push to tokenizer
       for await (const text of this.input) {
         if (text === tts.SynthesizeStream.FLUSH_SENTINEL) {
           tokenizerStream.flush();
@@ -581,13 +701,23 @@ class SynthesizeStream extends tts.SynthesizeStream {
         }
       }
       tokenizerStream.endInput();
+
+      // Wait for all text to be sent and all flushes to complete
       await sendPromise;
 
-      await this.#flushContext(ws);
-      await this.#closeContext(ws);
-      await processing;
+      // Wait a bit for any final audio chunks that may still be in transit
+      const AUDIO_DRAIN_TIMEOUT_MS = 500;
+      const waitStart = Date.now();
+      while (Date.now() - waitStart < AUDIO_DRAIN_TIMEOUT_MS) {
+        const timeSinceLastAudio = Date.now() - lastAudioReceivedAt;
+        if (lastAudioReceivedAt > 0 && timeSinceLastAudio > 200) {
+          // No audio for 200ms, we're done
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
 
-      // Flush remaining frames
+      // Flush remaining frames from the audio byte stream
       for (const frame of bstream.flush()) {
         this.queue.put({
           requestId: this.#contextId,
@@ -597,9 +727,11 @@ class SynthesizeStream extends tts.SynthesizeStream {
         });
       }
     } catch (e) {
-      log().error({ error: e }, 'Error in SynthesizeStream run');
+      this.#logger.error({ error: e, contextId: this.#contextId }, 'Error in SynthesizeStream run');
       throw e;
     } finally {
+      // Keep context open for multi-turn conversation - only unregister this stream's listener
+      // Context will be closed when TTS.close() is called on disconnect
       this.#tts.pool.unregisterListener(this.#contextId);
     }
   }
@@ -650,13 +782,6 @@ class SynthesizeStream extends tts.SynthesizeStream {
   #flushContext(ws: WebSocket): Promise<void> {
     return this.#send(ws, {
       flush_context: {},
-      contextId: this.#contextId,
-    });
-  }
-
-  #closeContext(ws: WebSocket): Promise<void> {
-    return this.#send(ws, {
-      close_context: {},
       contextId: this.#contextId,
     });
   }

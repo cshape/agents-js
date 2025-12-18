@@ -28,9 +28,9 @@ export default defineAgent({
 
     // Create TTS instance
     const tts = new inworld.TTS({
-      timestampType: 'WORD',
-      voice: 'Hades',
-      model: 'inworld-tts-1',
+      // timestampType: 'WORD',
+      voice: 'Alex',
+      model: 'inworld-tts-1.5-max',
       encoding: 'LINEAR16',
       textNormalization: 'ON',
       bitRate: 64000,
@@ -60,7 +60,7 @@ export default defineAgent({
     const session = new voice.AgentSession({
       // Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
       // See all available models at https://docs.livekit.io/agents/models/stt/
-      stt: 'assemblyai/universal-streaming:en',
+      stt: 'cartesia/ink-whisper',
       // A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
       // See all available models at https://docs.livekit.io/agents/models/llm/
       llm: 'openai/gpt-4.1-mini',
